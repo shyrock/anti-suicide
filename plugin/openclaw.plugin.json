@@ -1,0 +1,21 @@
+{
+  "id": "anti-suicide",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "supervisorPy": {
+        "type": "string",
+        "description": "Absolute path to supervisor.py (default: ~/.openclaw/workspace/skills/anti-suicide/scripts/supervisor.py)"
+      },
+      "verifyTimeout": {
+        "type": "number",
+        "description": "Seconds to monitor health after modification (default: 60)"
+      },
+      "verifyPreDelay": {
+        "type": "number",
+        "description": "Seconds to wait before first health check (default: 5)"
+      }
+    }
+  }
+}

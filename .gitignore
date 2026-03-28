@@ -1,0 +1,4 @@
+scripts/__pycache__/
+plugin/dist/
+plugin/node_modules/
+.claude/
