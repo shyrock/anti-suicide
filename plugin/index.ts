@@ -23,16 +23,45 @@ const OPENCLAW_HOME = path.join(os.homedir(), ".openclaw");
 /** Absolute path prefixes / exact filenames that are considered critical. */
 const CRITICAL_PREFIXES: string[] = [
   OPENCLAW_HOME,
+  // System network config directories
+  "/etc/netplan",
+  "/etc/network",
+  "/etc/iptables",
+  "/etc/ufw",
+  "/etc/firewalld",
+  // Windows system network config dir (normalised to forward slashes for comparison)
+  path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "drivers", "etc"),
 ];
 
 /** Basename-level matches (regardless of directory). */
 const CRITICAL_BASENAMES: string[] = [
+  // OpenClaw core configs
   "openclaw.json",
   "AGENTS.md",
   "SOUL.md",
   "TOOLS.md",
   "docker-compose.yml",
   "docker-compose.yaml",
+  // System network / DNS
+  "hosts",
+  "resolv.conf",
+  "nsswitch.conf",
+  "networks",
+  // System proxy / environment
+  "environment",       // /etc/environment — system-wide HTTP_PROXY etc.
+  ".bashrc",
+  ".bash_profile",
+  ".profile",
+  ".curlrc",
+  ".gitconfig",        // git http.proxy / https.proxy
+  // Firewall
+  "ufw.conf",
+  "user.rules",
+  "firewalld.conf",
+  "rules.v4",
+  "rules.v6",
+  // macOS firewall
+  "com.apple.alf.plist",
 ];
 
 const SUPERVISOR_PY = path.join(
