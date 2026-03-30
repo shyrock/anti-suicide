@@ -2,18 +2,22 @@
 """
 anti-suicide supervisor for OpenClaw
 
-Three sub-commands:
+Sub-commands:
   snapshot     -- capture health baseline + backup files, print session dir
   verify       -- monitor health post-modification, auto-rollback if degraded
   validate-json -- validate a JSON string before writing
+  watch        -- continuously watch files for manual edits, auto-rollback on degradation
+  rollback     -- manually restore a session or single backup file
 
 Usage:
   SESSION=$(python supervisor.py snapshot --files ~/.openclaw/openclaw.json)
   python supervisor.py verify --session $SESSION --timeout 60 --interval 5
   python supervisor.py validate-json --content '{"key": "value"}'
+  python supervisor.py watch --files ~/.openclaw/openclaw.json --interval 3
 """
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -34,6 +38,82 @@ SESSION_BASE = Path(tempfile.gettempdir())
 # Minimum channels that should be connected for the service to be considered healthy.
 # Set to 0 to only require the gateway itself to be alive.
 MIN_HEALTHY_CHANNELS = 0
+
+# External host used to test outbound TCP connectivity (port 443).
+# Override with ANTI_SUICIDE_CONNECTIVITY_HOST env var.
+CONNECTIVITY_HOST = os.environ.get("ANTI_SUICIDE_CONNECTIVITY_HOST", "8.8.8.8")
+CONNECTIVITY_PORT = 443
+
+
+# ── System config file discovery ───────────────────────────────────────────────
+
+def get_system_config_files() -> list[Path]:
+    """
+    Return a platform-aware list of system-level config files that can affect
+    network connectivity, DNS resolution, firewall rules, and proxy settings.
+    Only paths that actually exist on this machine are included.
+    """
+    import platform
+    system = platform.system()
+    candidates: list[Path] = []
+
+    if system == "Windows":
+        windir = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        etc    = windir / "System32" / "drivers" / "etc"
+        candidates += [
+            etc / "hosts",      # DNS override — most common sabotage vector
+            etc / "networks",
+        ]
+        # Shell proxy env vars live in user profile scripts (Git Bash / WSL)
+        home = Path.home()
+        candidates += [
+            home / ".bashrc",
+            home / ".bash_profile",
+            home / ".profile",
+            home / ".gitconfig",    # git http.proxy / https.proxy
+            home / ".curlrc",       # curl proxy settings
+        ]
+
+    elif system in ("Linux", "Darwin"):
+        candidates += [
+            Path("/etc/hosts"),
+            Path("/etc/resolv.conf"),       # DNS resolver
+            Path("/etc/nsswitch.conf"),     # resolver order
+            Path("/etc/environment"),       # system-wide env (includes proxy vars)
+            Path("/etc/profile"),
+            Path("/etc/gitconfig"),
+            Path(os.path.expanduser("~/.gitconfig")),
+            Path(os.path.expanduser("~/.curlrc")),
+            Path(os.path.expanduser("~/.bashrc")),
+            Path(os.path.expanduser("~/.bash_profile")),
+            Path(os.path.expanduser("~/.profile")),
+        ]
+        # Firewall
+        candidates += [
+            Path("/etc/iptables/rules.v4"),
+            Path("/etc/iptables/rules.v6"),
+            Path("/etc/ufw/ufw.conf"),
+            Path("/etc/ufw/user.rules"),
+            Path("/etc/firewalld/firewalld.conf"),
+        ]
+        # Network / proxy
+        candidates += [
+            Path("/etc/network/interfaces"),
+            Path("/etc/systemd/resolved.conf"),
+            Path("/etc/proxychains.conf"),
+            Path("/etc/proxychains4.conf"),
+        ]
+        # netplan directory: watch all yaml files inside
+        netplan_dir = Path("/etc/netplan")
+        if netplan_dir.is_dir():
+            candidates += list(netplan_dir.glob("*.yaml"))
+
+        if system == "Darwin":
+            candidates += [
+                Path("/Library/Preferences/com.apple.alf.plist"),  # macOS firewall
+            ]
+
+    return [p for p in candidates if p.exists()]
 
 
 # ── Health probes ───────────────────────────────────────────────────────────────
@@ -107,18 +187,33 @@ def probe_channels() -> tuple[bool, str, list[dict]]:
     return ok, summary, channels
 
 
+def probe_outbound() -> tuple[bool, str]:
+    """
+    Test outbound TCP connectivity to CONNECTIVITY_HOST:CONNECTIVITY_PORT.
+    Catches firewall blocks and broken routing that don't affect the local gateway.
+    """
+    import socket
+    try:
+        with socket.create_connection((CONNECTIVITY_HOST, CONNECTIVITY_PORT), timeout=5):
+            return True, f"outbound TCP {CONNECTIVITY_HOST}:{CONNECTIVITY_PORT} reachable"
+    except (ConnectionRefusedError, OSError) as e:
+        return False, f"outbound TCP {CONNECTIVITY_HOST}:{CONNECTIVITY_PORT} blocked: {e}"
+
+
 def take_health_snapshot() -> dict:
     """Collect a full health snapshot and return it as a dict."""
     doctor_ok, doctor_out   = probe_doctor()
     port_ok,   port_msg     = probe_gateway_port()
     chan_ok,   chan_msg, _   = probe_channels()
+    out_ok,    out_msg      = probe_outbound()
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "doctor":  {"ok": doctor_ok, "output": doctor_out},
-        "gateway": {"ok": port_ok,   "message": port_msg},
-        "channels":{"ok": chan_ok,   "message": chan_msg},
-        "overall_ok": doctor_ok and port_ok and chan_ok,
+        "doctor":   {"ok": doctor_ok, "output": doctor_out},
+        "gateway":  {"ok": port_ok,   "message": port_msg},
+        "channels": {"ok": chan_ok,   "message": chan_msg},
+        "outbound": {"ok": out_ok,    "message": out_msg},
+        "overall_ok": doctor_ok and port_ok and chan_ok and out_ok,
     }
 
 
@@ -134,6 +229,8 @@ def print_snapshot(snapshot: dict, label: str = ""):
     print(f"  doctor:   {'OK' if snapshot['doctor']['ok'] else 'FAIL'}  — {snapshot['doctor']['output'][:120]}", file=sys.stderr)
     print(f"  gateway:  {'OK' if snapshot['gateway']['ok'] else 'FAIL'}  — {snapshot['gateway']['message']}", file=sys.stderr)
     print(f"  channels: {'OK' if snapshot['channels']['ok'] else 'FAIL'}  — {snapshot['channels']['message']}", file=sys.stderr)
+    if "outbound" in snapshot:
+        print(f"  outbound: {'OK' if snapshot['outbound']['ok'] else 'FAIL'}  — {snapshot['outbound']['message']}", file=sys.stderr)
 
 
 # ── Session helpers ────────────────────────────────────────────────────────────
@@ -294,7 +391,13 @@ def cmd_snapshot(args):
         # Still create session so caller can choose to proceed with awareness
         print("UNHEALTHY-BASELINE", file=sys.stderr)
 
-    files = args.files or []
+    files = list(args.files or [])
+    if getattr(args, "system", False):
+        sys_files = get_system_config_files()
+        files += [str(f) for f in sys_files]
+        print(f"[anti-suicide] --system: adding {len(sys_files)} system config file(s):", file=sys.stderr)
+        for f in sys_files:
+            print(f"  {f}", file=sys.stderr)
     manifest = backup_files(session_dir, files)
     save_session_meta(session_dir, baseline, manifest)
 
@@ -340,6 +443,8 @@ def cmd_verify(args):
                 reasons.append(f"gateway: {snap['gateway']['message']}")
             if not snap["channels"]["ok"]:
                 reasons.append(f"channels: {snap['channels']['message']}")
+            if not snap.get("outbound", {}).get("ok", True):
+                reasons.append(f"outbound: {snap['outbound']['message']}")
             reason = "; ".join(reasons) if reasons else "unknown degradation"
 
             do_rollback_and_restart(session_dir, meta, reason)
@@ -360,6 +465,137 @@ def cmd_validate_json(args):
     except json.JSONDecodeError as e:
         print(f"INVALID JSON: {e}")
         sys.exit(1)
+
+
+def _file_hash(p: Path) -> str | None:
+    """Return MD5 hex digest of file contents, or None if unreadable."""
+    try:
+        h = hashlib.md5()
+        with open(p, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except (OSError, IOError):
+        return None
+
+
+def cmd_watch(args):
+    """
+    Continuously poll config files for manual changes.
+    On change: monitor health for --verify-timeout seconds.
+    If health degrades: auto-rollback to the last known-good state.
+    If health holds: advance the safe backup to the new state.
+    """
+    explicit = [Path(f).expanduser().resolve() for f in (args.files or [])]
+    system   = get_system_config_files() if getattr(args, "system", False) else []
+    # Deduplicate while preserving order: explicit files first, then system files
+    seen: set[Path] = set()
+    files: list[Path] = []
+    for f in explicit + system:
+        if f not in seen:
+            seen.add(f)
+            files.append(f)
+
+    if not files:
+        print("ERROR: no files to watch. Provide --files and/or --system.", file=sys.stderr)
+        sys.exit(1)
+
+    poll_interval    = args.interval
+    verify_timeout   = args.verify_timeout
+    verify_interval  = args.verify_interval
+
+    print(f"[anti-suicide] watch mode — monitoring {len(files)} file(s)", file=sys.stderr)
+    if system:
+        print(f"  ({len(explicit)} explicit + {len(system)} system)", file=sys.stderr)
+    for f in files:
+        print(f"  {f}", file=sys.stderr)
+
+    # ── Initial safe backup ────────────────────────────────────────────────────
+    safe_session = create_session()
+    print(f"[anti-suicide] Initial session: {safe_session}", file=sys.stderr)
+
+    baseline = take_health_snapshot()
+    print_snapshot(baseline, label="BASELINE")
+    if not is_healthy(baseline):
+        print("[anti-suicide] WARNING: Service already unhealthy. Watching anyway.", file=sys.stderr)
+
+    manifest = backup_files(safe_session, [str(f) for f in files])
+    save_session_meta(safe_session, baseline, manifest)
+    safe_meta = load_session_meta(safe_session)
+
+    # Record initial file hashes (known-good state)
+    file_hashes: dict[Path, str | None] = {f: _file_hash(f) for f in files}
+
+    print(f"[anti-suicide] Polling every {poll_interval}s. Press Ctrl+C to stop.", file=sys.stderr)
+
+    try:
+        while True:
+            time.sleep(poll_interval)
+
+            # ── Detect changes ─────────────────────────────────────────────────
+            changed: list[Path] = []
+            for f in files:
+                new_hash = _file_hash(f)
+                if new_hash != file_hashes[f]:
+                    changed.append(f)
+                    file_hashes[f] = new_hash
+
+            if not changed:
+                continue
+
+            ts = datetime.now(timezone.utc).isoformat()
+            print(f"\n[anti-suicide] [{ts}] Manual change detected:", file=sys.stderr)
+            for f in changed:
+                print(f"  CHANGED: {f}", file=sys.stderr)
+
+            # ── Post-change health monitoring ──────────────────────────────────
+            print(f"[anti-suicide] Monitoring health for {verify_timeout}s "
+                  f"(interval {verify_interval}s)...", file=sys.stderr)
+
+            deadline = time.time() + verify_timeout
+            check_num = 0
+            rolled_back = False
+
+            while time.time() < deadline:
+                time.sleep(verify_interval)
+                check_num += 1
+                snap = take_health_snapshot()
+                elapsed = int(time.time() - (deadline - verify_timeout))
+                print(f"\n[anti-suicide] Check #{check_num} at +{elapsed}s:", file=sys.stderr)
+                print_snapshot(snap)
+
+                if not is_healthy(snap):
+                    reasons = []
+                    if not snap["doctor"]["ok"]:
+                        reasons.append(f"openclaw doctor: {snap['doctor']['output'][:200]}")
+                    if not snap["gateway"]["ok"]:
+                        reasons.append(f"gateway: {snap['gateway']['message']}")
+                    if not snap["channels"]["ok"]:
+                        reasons.append(f"channels: {snap['channels']['message']}")
+                    if not snap.get("outbound", {}).get("ok", True):
+                        reasons.append(f"outbound: {snap['outbound']['message']}")
+                    reason = "; ".join(reasons) if reasons else "unknown degradation"
+
+                    do_rollback_and_restart(safe_session, safe_meta, reason)
+
+                    # Reset hashes to match the restored files
+                    file_hashes = {f: _file_hash(f) for f in files}
+                    rolled_back = True
+                    break
+
+            if not rolled_back:
+                # ── Advance safe backup to new state ───────────────────────────
+                print(f"\n[anti-suicide] Service healthy after change. Advancing safe backup.",
+                      file=sys.stderr)
+                safe_session = create_session()
+                manifest = backup_files(safe_session, [str(f) for f in files])
+                new_baseline = take_health_snapshot()
+                save_session_meta(safe_session, new_baseline, manifest)
+                safe_meta = load_session_meta(safe_session)
+                print(f"[anti-suicide] New safe session: {safe_session}", file=sys.stderr)
+
+    except KeyboardInterrupt:
+        print("\n[anti-suicide] Watch mode stopped.", file=sys.stderr)
 
 
 def cmd_rollback(args):
@@ -399,6 +635,8 @@ def main():
     p_snap = sub.add_parser("snapshot", help="Capture baseline + backup files")
     p_snap.add_argument("--files", nargs="*", default=[], metavar="FILE",
                         help="Files that will be modified (to back up)")
+    p_snap.add_argument("--system", action="store_true",
+                        help="Also back up auto-detected system config files (hosts, resolv.conf, etc.)")
 
     # verify
     p_verify = sub.add_parser("verify", help="Monitor health post-modification")
@@ -415,6 +653,19 @@ def main():
     p_vj = sub.add_parser("validate-json", help="Validate a JSON string")
     p_vj.add_argument("--content", required=True, help="JSON string to validate")
 
+    # watch
+    p_watch = sub.add_parser("watch", help="Watch files for manual edits; auto-rollback on health degradation")
+    p_watch.add_argument("--files", nargs="*", default=[], metavar="FILE",
+                         help="Config files to watch (can be combined with --system)")
+    p_watch.add_argument("--system", action="store_true",
+                         help="Also watch auto-detected system config files (hosts, proxy env files, etc.)")
+    p_watch.add_argument("--interval",        type=int, default=3,
+                         help="Seconds between file-state polls (default: 3)")
+    p_watch.add_argument("--verify-timeout",  type=int, default=60, dest="verify_timeout",
+                         help="Seconds to monitor health after a change is detected (default: 60)")
+    p_watch.add_argument("--verify-interval", type=int, default=5,  dest="verify_interval",
+                         help="Seconds between health checks during verify window (default: 5)")
+
     # rollback
     p_rb = sub.add_parser("rollback", help="Manual rollback")
     rb_group = p_rb.add_mutually_exclusive_group(required=True)
@@ -429,6 +680,7 @@ def main():
         "snapshot":      cmd_snapshot,
         "verify":        cmd_verify,
         "validate-json": cmd_validate_json,
+        "watch":         cmd_watch,
         "rollback":      cmd_rollback,
     }
     dispatch[args.command](args)
